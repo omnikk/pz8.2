@@ -1,0 +1,27 @@
+# git
+.git
+.gitignore
+
+# документация
+README.md
+*.md
+
+# IDE
+.vscode/
+.idea/
+
+# скриншоты и временные файлы
+images/
+*.log
+*.tmp
+
+# тестовые артефакты curl
+cookies.txt
+login.json
+body.json
+body2.json
+xss.json
+
+# приватные сертификаты — не должны попадать в контекст сборки
+deploy/tls/key.pem
+deploy/tls/cert.pem
