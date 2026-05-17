@@ -1,322 +1,371 @@
-# Практическое занятие №7 — Dockerfile и сборка контейнеров
+# Практическое занятие №8 — Настройка GitHub Actions для CI/CD
 
 **Студент:** Выборнов Олег Андреевич
 **Группа:** ЭФМО-02-25
-**Дисциплина:** Технологии программирования
+**Дисциплина:** Технологии индустриального программирования
+**Преподаватель:** Адышкин Сергей Сергеевич
 
 ## Цель работы
 
-Упаковать сервисы в Docker-образы через multi-stage сборку для минимизации размера и обеспечения воспроизводимости. Запускать связанные сервисы через docker compose с общей сетью.
+Настроить автоматический pipeline в GitHub Actions для проверки, сборки и упаковки Go-проекта в Docker-образ с публикацией в GitHub Container Registry.
 
-## Архитектура
+## Что такое CI и CD
+
+**CI (Continuous Integration)** — непрерывная интеграция. После каждого изменения кода система автоматически проверяет проект: устанавливает зависимости, запускает тесты, выполняет сборку. Это исключает «забывания» и сразу показывает, не сломал ли разработчик проект своими правками.
+
+**CD (Continuous Delivery / Deployment)** — два варианта трактовки:
+- *Continuous Delivery* — готовность к доставке: артефакт собран, проверен, упакован и лежит готовым к деплою.
+- *Continuous Deployment* — автоматическое развёртывание: после успешной сборки артефакт сразу выкатывается на продакшен без ручного шага.
+
+В этой работе реализован CI + Continuous Delivery: pipeline проверяет код, собирает Docker-образы и публикует их в registry. Деплой на сервер не выполняется (опциональная часть методички).
+
+## Выбранная платформа
+
+**GitHub Actions** — pipeline описан в файле `.github/workflows/ci.yml`. Выбор обусловлен тем, что репозиторий хранится на GitHub: используется встроенный `GITHUB_TOKEN`, не нужно настраивать дополнительные секреты, образы публикуются в бесплатный `ghcr.io`.
+
+## Структура pipeline
 
 ```
-                  HTTPS (8443)
-   curl/браузер ─────────────► nginx ──► auth   (8081)
-                                    │
-                                    └──► tasks  (8082)
-                                              │
-                                              ▼
-                                        PostgreSQL (5432)
+push в main / PR в main
+        │
+        ▼
+┌─────────────────────────────┐
+│   Job: test-and-build       │
+│                             │
+│   1. checkout               │
+│   2. setup-go 1.25          │
+│   3. cache go modules       │
+│   4. go mod download        │
+│   5. go vet ./...           │
+│   6. go test -v ./...       │
+│   7. go build ./...         │
+└─────────────────────────────┘
+        │ (только при success + push в main)
+        ▼
+┌─────────────────────────────────────┐
+│   Job: docker-build-and-push        │
+│                                     │
+│   1. checkout                       │
+│   2. setup buildx                   │
+│   3. login to ghcr.io               │
+│   4. build & push pz8-auth          │
+│   5. build & push pz8-tasks         │
+└─────────────────────────────────────┘
+        │
+        ▼
+   ghcr.io/omnikk/pz8-auth:<sha>, :latest
+   ghcr.io/omnikk/pz8-tasks:<sha>, :latest
 ```
 
-Все четыре контейнера общаются внутри сети `app-network` по DNS-именам (`auth`, `tasks`, `postgres`, `nginx`). Наружу проброшен только порт 8443 nginx.
+**Ключевое решение в архитектуре:** Docker job стартует **только** после успеха test-and-build (`needs: test-and-build`) **и только** для push в main (`if: github.ref == 'refs/heads/main'`). Это значит:
+- PR-ветки прогоняют только тесты, не засоряя registry мусором
+- Если тест упал — образ не публикуется
+
+## Полный YAML
+
+```yaml
+name: CI Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  GO_VERSION: "1.25"
+
+jobs:
+  test-and-build:
+    name: Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Run tests
+        run: go test -v ./...
+
+      - name: Build all binaries
+        run: go build ./...
+
+  docker-build-and-push:
+    name: Docker Build & Push to GHCR
+    runs-on: ubuntu-latest
+    needs: test-and-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set lowercase repository owner
+        run: echo "REPO_OWNER=${GITHUB_REPOSITORY_OWNER,,}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push auth image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deploy/Dockerfile.auth
+          push: true
+          tags: |
+            ghcr.io/${{ env.REPO_OWNER }}/pz8-auth:${{ github.sha }}
+            ghcr.io/${{ env.REPO_OWNER }}/pz8-auth:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push tasks image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./deploy/Dockerfile.tasks
+          push: true
+          tags: |
+            ghcr.io/${{ env.REPO_OWNER }}/pz8-tasks:${{ github.sha }}
+            ghcr.io/${{ env.REPO_OWNER }}/pz8-tasks:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+```
+
+## Пояснение шагов
+
+### Job test-and-build
+
+| Шаг | Что делает |
+|---|---|
+| `actions/checkout@v4` | Клонирует репозиторий на раннер |
+| `actions/setup-go@v5` | Устанавливает Go 1.25 |
+| `actions/cache@v4` | Кеширует `~/go/pkg/mod` (модули) и `~/.cache/go-build` (кеш компиляции). Ключ зависит от хеша `go.sum` — пересоздаётся только при изменении зависимостей |
+| `go mod download` | Загружает зависимости из кеша или из интернета |
+| `go vet ./...` | Статический анализ: ищет shadowed-переменные, неправильные форматы Printf, недостижимый код |
+| `go test -v ./...` | Запускает все тесты (`-v` для подробного вывода в логах CI) |
+| `go build ./...` | Проверяет, что весь код собирается |
+
+### Job docker-build-and-push
+
+| Шаг | Что делает |
+|---|---|
+| `setup-buildx-action@v3` | Включает BuildKit — современный движок Docker-сборки с поддержкой кеша GHA |
+| `Set lowercase repository owner` | GHCR требует имя владельца в нижнем регистре, `${VAR,,}` в bash — преобразование в lowercase |
+| `docker/login-action@v3` | Логин в `ghcr.io` через автоматически выданный `GITHUB_TOKEN` |
+| `docker/build-push-action@v5` | Сборка по Dockerfile + push в registry в один шаг. `cache-from/to: type=gha` — кеш слоёв в GitHub Actions cache |
+
+## Формирование тега Docker-образа
+
+Каждый образ получает **два тега одновременно**:
+
+1. **`${{ github.sha }}`** — полный SHA коммита, например `0d2414d...`. Это **неизменяемая** ссылка: образ с этим тегом всегда соответствует конкретному коммиту. Используется для отладки и точного отката.
+2. **`latest`** — указывает на последний образ из main. Используется в `docker-compose.yml` на стейджинге/проде, чтобы не править тег при каждом обновлении.
+
+Пример:
+```
+ghcr.io/omnikk/pz8-tasks:0d2414d2c1c3a0e9f5...
+ghcr.io/omnikk/pz8-tasks:latest
+```
+
+Если потребуется откатиться — можно явно указать SHA предыдущего рабочего коммита и `docker pull` найдёт именно его.
+
+## Хранение секретов
+
+В данном pipeline используется **только** автоматически выданный `GITHUB_TOKEN`. Никаких внешних секретов не требуется, потому что публикация идёт во встроенный GitHub Container Registry.
+
+`GITHUB_TOKEN` — токен, который GitHub Actions создаёт автоматически для каждого run. Он имеет ограниченные права, истекает по окончании workflow и доступен только внутри этого конкретного запуска.
+
+В YAML на него ссылаемся как:
+```yaml
+password: ${{ secrets.GITHUB_TOKEN }}
+```
+
+Чтобы дать токену право push в registry, явно указываем permissions:
+```yaml
+permissions:
+  contents: read
+  packages: write
+```
+
+**Если бы понадобился внешний registry** (например, Docker Hub или private registry компании) — секреты `DOCKER_USERNAME` и `DOCKER_PASSWORD` хранились бы в **Settings → Secrets and variables → Actions**. В YAML они доступны как `${{ secrets.DOCKER_USERNAME }}`. Хранить их в коде, в `.env`-файле или в открытом виде в YAML **категорически нельзя** — это типичная ошибка постановки pipeline.
+
+## Тесты
+
+Чтобы CI был «честным» (не просто `|| echo "No tests"` для галочки), написаны юнит-тесты на сервисный слой auth в файле `services/auth/internal/service/auth_test.go`:
+
+```go
+func TestLogin_ValidCredentials(t *testing.T) {
+    s := New()
+    token, ok := s.Login("student", "student")
+    if !ok {
+        t.Fatal("expected login to succeed with valid credentials")
+    }
+    if token != "demo-token" {
+        t.Errorf("expected token %q, got %q", "demo-token", token)
+    }
+}
+
+func TestLogin_WrongPassword(t *testing.T) {
+    s := New()
+    _, ok := s.Login("student", "wrong-password")
+    if ok {
+        t.Fatal("expected login to fail with wrong password")
+    }
+}
+
+func TestVerify_ValidToken(t *testing.T) {
+    s := New()
+    subject, valid := s.Verify("demo-token")
+    if !valid {
+        t.Fatal("expected token to be valid")
+    }
+    if subject != "student" {
+        t.Errorf("expected subject %q, got %q", "student", subject)
+    }
+}
+```
+
+Пять тестов покрывают обе экспортируемые функции (`Login`, `Verify`) с позитивными и негативными сценариями. Если кто-то сломает логику авторизации — CI это поймает до мержа.
+
+## Результат: успешный прогон pipeline
+
+![Успешный прогон CI Pipeline](images/01_actions_overview.png)
+
+Workflow `CI Pipeline #1` для commit `0d2414d` отработал за 1m 30s, оба job'а — зелёные.
+
+## Опубликованные образы в GHCR
+
+![Образы в GitHub Container Registry](images/02_packages.png)
+
+Два пакета — `pz8-auth` и `pz8-tasks` — опубликованы в registry со всеми необходимыми тегами. Их можно использовать в любом окружении командой:
+
+```bash
+docker pull ghcr.io/omnikk/pz8-auth:latest
+docker pull ghcr.io/omnikk/pz8-tasks:latest
+```
 
 ## Структура проекта
 
 ```
-pz7/
+pz8/
+├── .github/
+│   └── workflows/
+│       └── ci.yml                    # GitHub Actions pipeline
 ├── deploy/
-│   ├── Dockerfile.auth          # multi-stage: golang:1.25-alpine → alpine:3.20
-│   ├── Dockerfile.tasks         # multi-stage: golang:1.25-alpine → alpine:3.20
-│   ├── docker-compose.yml       # 4 сервиса, общая сеть, healthcheck postgres
-│   ├── nginx.conf               # TLS-терминация, проксирование auth+tasks
-│   └── tls/                     # самоподписанный сертификат (в .gitignore)
+│   ├── Dockerfile.auth
+│   ├── Dockerfile.tasks
+│   ├── docker-compose.yml
+│   ├── nginx.conf
+│   └── tls/
 ├── migrations/
-│   └── 01_create_tasks_table.sql
 ├── services/
-│   ├── auth/                    # HTTP-сервис авторизации с cookies
-│   └── tasks/                   # CRUD задач + CSRF/XSS защита
+│   ├── auth/
+│   │   ├── cmd/auth/
+│   │   └── internal/
+│   │       ├── http/
+│   │       └── service/
+│   │           ├── auth.go
+│   │           └── auth_test.go      # ЮНИТ-ТЕСТЫ для CI
+│   └── tasks/
 ├── shared/
-│   ├── middleware/              # RequestID, Logging, CSRF, SecurityHeaders
-│   └── httpx/
-├── images/                      # скриншоты проверок
-├── .dockerignore                # исключает мусор из контекста сборки
+├── images/                           # скриншоты прогона CI
+├── .dockerignore
+├── .gitignore
 ├── go.mod
+├── go.sum
 └── README.md
 ```
 
-## Multi-stage Dockerfile
-
-### deploy/Dockerfile.tasks
-
-```dockerfile
-FROM golang:1.25-alpine AS builder
-WORKDIR /src
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=linux go build -o /out/tasks ./services/tasks/cmd/tasks
-
-FROM alpine:3.20
-RUN apk add --no-cache ca-certificates
-WORKDIR /app
-COPY --from=builder /out/tasks /app/tasks
-EXPOSE 8082
-ENTRYPOINT ["/app/tasks"]
-```
-
-**Что и зачем:**
-
-- `golang:1.25-alpine AS builder` — полный Go-toolchain нужен только для компиляции.
-- `CGO_ENABLED=0` — статическая сборка, бинарь не зависит от системных библиотек, работает в любом alpine.
-- Второй `FROM alpine:3.20` — стартует «с чистого листа», из первой стадии копируется ТОЛЬКО готовый бинарь.
-- `ca-certificates` — нужны, чтобы из контейнера можно было ходить по HTTPS наружу.
-- Финальный образ не содержит исходного кода, Go-компилятора, кеша модулей.
-
-`Dockerfile.auth` устроен аналогично, отличается только путём `./services/auth/cmd/auth`.
-
-## .dockerignore
-
-В корне проекта:
-
-```
-.git
-.gitignore
-README.md
-*.md
-.vscode/
-.idea/
-images/
-*.log
-*.tmp
-cookies.txt
-login.json
-body.json
-xss.json
-deploy/tls/key.pem
-deploy/tls/cert.pem
-```
-
-`.dockerignore` исключает файлы из контекста сборки — то, что Docker передаёт демону при `docker build`. Это:
-- ускоряет сборку (меньше данных передаётся),
-- уменьшает размер слоёв (если бы что-то из этого попало в COPY),
-- защищает от случайного попадания приватного ключа в образ.
-
-## docker-compose.yml — взаимодействие сервисов
-
-```yaml
-services:
-  postgres:
-    image: postgres:15-alpine
-    container_name: pz7-postgres
-    environment:
-      POSTGRES_USER:     tasks_user
-      POSTGRES_PASSWORD: tasks_pass
-      POSTGRES_DB:       tasks_db
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U tasks_user -d tasks_db"]
-      interval: 3s
-      retries: 10
-    networks: [app-network]
-
-  auth:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.auth
-    container_name: pz7-auth
-    environment:
-      AUTH_PORT: "8081"
-    networks: [app-network]
-
-  tasks:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.tasks
-    container_name: pz7-tasks
-    environment:
-      TASKS_PORT:    "8082"
-      AUTH_BASE_URL: "http://auth:8081"
-      DB_HOST:       postgres
-      DB_USER:       tasks_user
-      DB_PASSWORD:   tasks_pass
-      DB_NAME:       tasks_db
-    depends_on:
-      postgres:
-        condition: service_healthy
-      auth:
-        condition: service_started
-    networks: [app-network]
-
-  nginx:
-    image: nginx:1.27-alpine
-    container_name: pz7-nginx
-    ports:
-      - "8443:8443"
-    volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-      - ./tls:/etc/nginx/tls:ro
-    networks: [app-network]
-```
-
-**Ключевые моменты:**
-
-- `AUTH_BASE_URL: "http://auth:8081"` — tasks обращается к auth по имени сервиса, не по `localhost`. Docker-сеть резолвит имя в IP контейнера.
-- `depends_on: condition: service_healthy` — tasks стартует только когда postgres реально готов принимать соединения, а не просто запустился.
-- `:ro` на volume — конфиг nginx и сертификаты примонтированы только на чтение.
-
-## Переменные окружения
-
-| Сервис | Переменная | Значение | Описание |
-|---|---|---|---|
-| auth | `AUTH_PORT` | 8081 | HTTP-порт сервиса |
-| tasks | `TASKS_PORT` | 8082 | HTTP-порт сервиса |
-| tasks | `AUTH_BASE_URL` | http://auth:8081 | Адрес auth внутри docker-сети |
-| tasks | `DB_HOST` | postgres | Хост БД (имя сервиса в compose) |
-| tasks | `DB_PORT` | 5432 | Порт БД |
-| tasks | `DB_USER` | tasks_user | Пользователь БД |
-| tasks | `DB_PASSWORD` | tasks_pass | Пароль БД |
-| tasks | `DB_NAME` | tasks_db | Имя БД |
-
-Конфигурация передаётся через окружение, секретов в Dockerfile нет — образ можно безопасно публиковать.
-
-## Команды сборки и запуска
-
-### Сборка вручную
-
-```powershell
-# из корня проекта
-docker build -t pz7-auth:latest  -f deploy/Dockerfile.auth  .
-docker build -t pz7-tasks:latest -f deploy/Dockerfile.tasks .
-```
-
-### Запуск всего стека
-
-```powershell
-cd deploy
-docker compose up -d --build
-docker compose ps
-```
-
-### Просмотр логов
-
-```powershell
-docker compose logs -f tasks
-docker compose logs -f auth
-```
-
-### Остановка
-
-```powershell
-docker compose down
-
-# с удалением volume (БД будет пересоздана)
-docker compose down -v
-```
-
-## Проверки
-
-### 1. Статус контейнеров
-
-```powershell
-docker compose ps
-```
-
-Все четыре сервиса в `Up`, postgres имеет статус `healthy`.
-
-![Статус контейнеров](images/01_containers.png)
-
-### 2. Размеры образов
-
-```powershell
-docker images | Select-String "deploy-tasks|deploy-auth|nginx.*1.27-alpine|postgres.*15-alpine"
-```
-
-| Образ | Размер | Комментарий |
-|---|---|---|
-| `deploy-auth:latest` | 27.1 MB | alpine + статический Go-бинарь |
-| `deploy-tasks:latest` | 30 MB | alpine + бинарь + ca-certificates |
-| `nginx:1.27-alpine` | 74.5 MB | официальный образ nginx |
-| `postgres:15-alpine` | 392 MB | официальный образ БД |
-
-Размер наших образов (27-30 MB) — результат multi-stage сборки. Без неё образ на основе `golang:1.25-alpine` весил бы около 350 MB, потому что тащил бы с собой весь Go-toolchain.
-
-![Размеры образов](images/02_images.png)
-
-### 3. Внутренняя сеть Docker
-
-```powershell
-docker exec pz7-tasks wget -qO- --header="Authorization: Bearer demo-token" http://auth:8081/v1/auth/verify
-```
-
-Из контейнера `tasks` обращаемся к контейнеру `auth` по DNS-имени `auth` — Docker-сеть резолвит его в IP внутреннего адреса.
-
-Ответ: `{"valid":true,"subject":"student"}`
-
-![Внутренняя сеть Docker](images/03_internal_network.png)
-
-### 4. End-to-end: HTTPS логин
-
-```powershell
-Set-Content -Path login.json -Value '{"username":"student","password":"student"}'
-
-curl.exe -k -i -c cookies.txt -X POST https://localhost:8443/v1/auth/login `
-  -H "Content-Type: application/json" `
-  --data-binary "@login.json"
-```
-
-`200 OK`, две cookies (session+csrf), security headers. Запрос прошёл через nginx → auth.
-
-![Логин через HTTPS](images/04_login.png)
-
-### 5. Создание задачи через весь стек
-
-```powershell
-$csrf = (Get-Content cookies.txt | Select-String "csrf_token").ToString().Split("`t")[-1]
-Set-Content -Path body.json -Value '{"title":"docker test","description":"from pz7"}'
-
-curl.exe -k -i -b cookies.txt -X POST https://localhost:8443/v1/tasks `
-  -H "Content-Type: application/json" `
-  -H "X-CSRF-Token: $csrf" `
-  --data-binary "@body.json"
-```
-
-`201 Created`. Запрос прошёл: nginx → tasks → проверка auth (по docker-сети) → запись в postgres → ответ обратно.
-
-![Создание задачи через стек](images/05_create.png)
-
-### 6. Логи сервиса
-
-```powershell
-docker compose logs tasks --tail 20
-```
-
-Сервис пишет в stdout — это правильно для контейнеров: Docker сам собирает логи через драйвер. Никаких файлов в /var/log писать не нужно.
-
-![Логи tasks](images/06_logs.png)
-
 ## Контрольные вопросы
 
-**1. Зачем multi-stage сборка?**
+**1. Чем CI отличается от CD?**
 
-Чтобы в финальном образе не оставался Go-компилятор, исходный код и кеш модулей. В первой стадии (builder) собирается бинарь, во второй — копируется только он. Образ становится в 10+ раз меньше, в нём нечего ломать, поверхность атаки минимальна.
+CI (Continuous Integration) отвечает за **проверку и сборку**: после каждого коммита автоматически прогоняются линт, тесты, build. Цель — быстро обнаружить, что код сломан. CD (Continuous Delivery/Deployment) отвечает за **доставку**: упаковку артефакта, публикацию в registry и/или развёртывание на сервере. Continuous Delivery останавливается на готовом артефакте, Continuous Deployment автоматически выкатывает его в продакшен.
 
-**2. Почему два сервиса в одной docker-сети могут обращаться друг к другу по имени?**
+**2. Почему pipeline должен запускать тесты?**
 
-Docker запускает встроенный DNS-сервер (`127.0.0.11`) внутри каждой пользовательской сети. Имена сервисов из `docker-compose.yml` регистрируются как DNS-записи. Когда tasks делает запрос на `http://auth:8081`, ОС в контейнере резолвит `auth` через этот DNS и получает IP контейнера auth.
+Тесты проверяют, что код работает по спецификации. Запуск тестов в pipeline гарантирует, что:
+- проверка происходит на каждое изменение, а не «когда вспомнили»;
+- проверка идёт в одинаковом, чистом окружении (а не на «у меня всё работает»);
+- сломанный код не попадёт в main, потому что pipeline покажет красный статус.
 
-**3. Зачем `.dockerignore`?**
+В моём проекте при попытке смержить PR, ломающий `Login`, тесты `TestLogin_ValidCredentials` упадут и блокируют мерж.
 
-При `docker build` весь контекст (каталог сборки) отправляется демону Docker, даже файлы, которые потом не попадут в образ. `.dockerignore` исключает ненужные файлы из этой передачи: ускоряет сборку, защищает от случайной утечки приватных файлов (ключи, пароли) через COPY, уменьшает размер слоёв если бы кто-то скопировал .git или images.
+**3. Зачем нужен автоматический build?**
 
-**4. Чем `condition: service_healthy` отличается от обычного `depends_on`?**
+Build в CI выявляет ошибки компиляции, которые могли проскочить локально из-за разных версий Go, забытых файлов или зависимостей. Если код компилируется на CI-раннере с чистым окружением — значит он гарантированно соберётся и в продакшене. Это снижает «у меня же работало».
 
-Обычный `depends_on` ждёт только запуска контейнера — но запуск ≠ готовность. PostgreSQL может стартовать за 2 секунды, но принимать соединения только через 8. Без `service_healthy` сервис tasks падал бы при попытке подключиться к БД на старте. С healthcheck Docker реально проверяет `pg_isready` каждые 3 секунды и поднимает зависимые сервисы только после `healthy`.
+**4. Почему важно собирать Docker-образ в CI, а не только локально?**
 
-**5. Почему секреты передаются через переменные окружения, а не зашиваются в Dockerfile?**
+- *Воспроизводимость:* образ собран в стерильной среде, без артефактов локальной машины.
+- *Версионирование:* образ автоматически тегируется хешем коммита, можно точно сопоставить артефакт и исходный код.
+- *Готовность к деплою:* образ сразу попадает в registry, продакшн-серверу не нужно собирать самому — только `docker pull`.
+- *Безопасность:* в локальной сборке могут попасть посторонние файлы (`.env`, ключи). В CI окружение чистое, плюс `.dockerignore` контролируется через git.
 
-Если зашить пароль БД в Dockerfile, он попадёт в каждый слой образа — извлекается через `docker history` или просмотр слоёв. Образ становится непереносимым: один и тот же бинарь не получится использовать с разными БД. Через окружение секрет инжектится в момент запуска и в образе не оседает. Для production используют secrets manager или Docker Swarm secrets, в учебной работе — переменные в compose.
+**5. Что такое CI secrets?**
 
-**6. Почему сервис должен писать логи в stdout, а не в файл?**
+Это защищённое хранилище переменных в CI-системе для конфиденциальных значений: токены доступа, пароли БД, SSH-ключи, API-ключи внешних сервисов. Они зашифрованы, доступны только во время выполнения pipeline, не отображаются в логах. В GitHub Actions это **Settings → Secrets and variables → Actions**; обращение из YAML — через `${{ secrets.NAME }}`.
 
-Docker собирает stdout контейнера через драйвер логирования (json-file по умолчанию, можно настроить syslog, fluentd, journald). Если писать в файл внутри контейнера — он останется внутри, при перезапуске потеряется (если volume не настроен), сложнее агрегировать с других инстансов. stdout — стандарт для контейнерных приложений (12-factor app).
+**6. Почему нельзя хранить токены и SSH-ключи в репозитории?**
+
+Репозиторий доступен всем коллабораторам (в публичных — всему интернету). Любой, кто получит доступ к коду, получит и секреты. Даже если позже удалить из коммита — секрет останется в истории git и в форках. Стандартная практика: секреты живут в защищённом хранилище CI, в код попадают только их имена (`${{ secrets.X }}`), сами значения видит только runner во время выполнения.
+
+**7. Для чего нужен тег Docker-образа?**
+
+Тег — это имя версии образа. Он позволяет:
+- *Идентифицировать* конкретную версию (по SHA коммита, например).
+- *Откатываться* на предыдущую рабочую версию (`docker pull image:abc1234`).
+- *Маркировать* стабильные срезы (`v1.0`, `latest`, `stable`).
+- *Различать* окружения (`prod`, `staging`, `dev`).
+
+Без тегов все образы получают `latest`, и история теряется — невозможно понять, какой код в каком образе.
+
+**8. Что делает job docker-build?**
+
+В моём pipeline это **второй** job (`docker-build-and-push`). Он запускается **только после** успеха job test-and-build. Внутри: логинится в registry, собирает образ для auth, собирает образ для tasks, пушит оба образа в `ghcr.io` с двумя тегами (SHA и latest). Использует BuildKit с кешированием слоёв.
+
+**9. Почему в multi-service проекте важен working-directory?**
+
+В одном репозитории могут лежать несколько независимых сервисов со своими `go.mod`. Команды `go test`, `go build`, `docker build` работают **из конкретной директории**. Если не указать `working-directory` — команда выполнится в корне репо, не найдёт `go.mod` нужного сервиса и упадёт с ошибкой. В моём проекте используется один общий `go.mod` в корне (Go workspace не нужен), поэтому `working-directory` явно не указывался, но в проектах с разделёнными модулями это критично.
+
+**10. Какие риски возникают при полностью автоматическом деплое?**
+
+- *Автоматический выкат сломанной версии* — если тесты не покрывают важный сценарий, ошибка попадёт в прод.
+- *Отсутствие момента «остановиться»* — нет человека, который проверит и одобрит выкат.
+- *Сложность отката* — нужна продуманная стратегия (blue-green, canary), иначе откат тоже становится автоматическим и может усугубить инцидент.
+- *Утечка секретов* через автоматизацию — если pipeline скомпрометирован, атакующий получает доступ к продакшену.
+- *Каскадные сбои* — если падает база миграций или внешний сервис, автоматический деплой может зациклиться на повторных попытках.
+
+Реальные системы используют гибрид: CI полностью автоматический, а CD-этап выкатки в прод требует ручного approve (Environments в GitHub Actions, manual gates в GitLab).
